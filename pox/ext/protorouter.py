@@ -1,14 +1,20 @@
-# Import some POX stuff
-from pox.core import core                       # Main POX object
-import pox.openflow.libopenflow_01 as of        # OpenFlow 1.0 library
-from pox.lib.addresses import EthAddr, IPAddr   # Address types
-from pox.lib.packet.ethernet import ethernet
-from pox.lib.packet.arp import arp
-from pox.lib.packet.ipv4 import ipv4
-# ── ICMP OPCIONAL ── quitar esta línea si no se quiere soporte ICMP
-from pox.lib.packet.icmp import icmp
+# nat_router.py
+# Coordinador principal del NAT.
+# Orquesta ARPHandler, NATTable y FlowManager.
+# Es el único que escucha eventos OpenFlow directamente.
+
+from pox.core import core
+import pox.openflow.libopenflow_01 as of
+import pox.lib.packet as pkt
+
+from config import (PUBLIC_IP, PUBLIC_MAC, PRIVATE_MAC,
+                    PUBLIC_PORT, PRIVATE_SUBNET, PRIVATE_MASK)
+from arp_handler import ARPHandler
+from nat_table   import NATTable
+from flow_manager import FlowManager
 
 log = core.getLogger()
+
 RED    = "\033[31m"
 GREEN  = "\033[32m"
 YELLOW = "\033[33m"
@@ -16,412 +22,215 @@ CYAN   = "\033[36m"
 BLUE   = "\033[34m"
 RESET  = "\033[0m"
 
-
 def log_color(color, msg):
     log.info(f"{color}{msg}{RESET}")
 
 
-# ──────────────────────────────────────────────
-#  Configuración de red (sin valores hardcodeados de hosts)
-# ──────────────────────────────────────────────
-PRIVATE_SUBNET = IPAddr("192.168.1.0")      # Red interna
-PRIVATE_MASK   = 24                         # Máscara de la red interna
-PRIVATE_IP     = IPAddr("192.168.1.254")    # IP del NAT en la red privada
-PUBLIC_IP      = IPAddr("200.0.0.254")      # IP del NAT en la red pública
-PUBLIC_MAC     = EthAddr("00:00:00:aa:aa:aa")  # MAC del NAT hacia la red pública
-PRIVATE_MAC    = EthAddr("00:00:00:bb:bb:bb")  # MAC del NAT hacia la red privada
-PUBLIC_PORT    = 1                          # Puerto del switch conectado a la red pública
 
-NAT_PORT_START = 10000                      # Primer puerto público a asignar
-NAT_PORT_END   = 65535                      # Último puerto público a asignar
-FLOW_TIMEOUT   = 60                         # Segundos de inactividad antes de expirar flujo
-
-
-class ProtoRouter(object):
+class ProtoRouter:
 
     def __init__(self, connection):
-        self.connection = connection
+        self._connection  = connection
+
+        self._nat_table   = NATTable()
+        self._flow_mgr    = FlowManager(connection)
+        self._arp_handler = ARPHandler(connection, self._on_mac_resolved)
+
         connection.addListeners(self)
+        log_color(YELLOW, f"ProtoRouter (NAT/PAT) iniciado.")
 
-        # ── Tabla ARP dinámica ──────────────────────────────────────────
-        # ip -> (mac, puerto_del_switch)
-        self.arp_table = {}
-
-        # ── Tablas NAT ──────────────────────────────────────────────────
-        # Saliente: (proto, ip_privada, puerto_privado) -> puerto_publico
-        self.nat_out = {}
-        # Entrante: (proto, puerto_publico) -> (ip_privada, puerto_privado, in_port)
-        self.nat_in  = {}
-        # Próximo puerto público disponible
-        self.next_port = NAT_PORT_START
-
-        # ── Cola de paquetes pendientes de resolución ARP ───────────────
-        # ip_destino -> [(packet_ethernet, in_port), ...]
-        self.pending = {}
-
-        log_color(YELLOW, "ProtoRouter (NAT/PAT) iniciado.")
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  Dispatcher principal
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Eventos OpenFlow ───────────────────────────────────────────────────
 
     def _handle_PacketIn(self, event):
-        if not event.parsed.parsed:
-            log.warning("[DROP] Trama no reconocida.")
+        eth = event.parsed
+        if not eth or not eth.parsed:
+            log_color(RED, "Paquete no reconocido, descartando")
             return
 
-        pkt = event.parsed
+        if eth.type == pkt.ethernet.ARP_TYPE:
+            self._arp_handler.handle(event, eth.payload)
 
-        if pkt.type == ethernet.ARP_TYPE:
-            self.handle_arp(event)
-        elif pkt.type == ethernet.IP_TYPE:
-            self.handle_ip(event)
-        else:
-            log_color(YELLOW, f"Paquete ignorado: protocolo 0x{pkt.type:04x}")
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  Manejo de ARP
-    # ══════════════════════════════════════════════════════════════════════
-
-    def handle_arp(self, event):
-        pkt     = event.parsed
-        arp_pkt = pkt.payload
-        in_port = event.port
-
-        # Aprender siempre la MAC del remitente
-        self.arp_table[arp_pkt.protosrc] = (arp_pkt.hwsrc, in_port)
-        log_color(BLUE, f"ARP aprendido: {arp_pkt.protosrc} → {arp_pkt.hwsrc} (port {in_port})")
-
-        if arp_pkt.opcode == arp.REQUEST:
-            # ¿Me preguntan a mí?
-            if arp_pkt.protodst == PUBLIC_IP:
-                log_color(BLUE, f"ARP REQUEST para IP pública ({PUBLIC_IP}), respondiendo con {PUBLIC_MAC}")
-                self._send_arp_reply(arp_pkt, PUBLIC_MAC, in_port)
-
-            elif arp_pkt.protodst == PRIVATE_IP:
-                log_color(BLUE, f"ARP REQUEST para IP privada ({PRIVATE_IP}), respondiendo con {PRIVATE_MAC}")
-                self._send_arp_reply(arp_pkt, PRIVATE_MAC, in_port)
-
-            else:
-                # No es para mí, ignorar
-                log_color(YELLOW, f"ARP REQUEST para {arp_pkt.protodst}: no es mi IP, ignorando.")
-
-        elif arp_pkt.opcode == arp.REPLY:
-            # Recibí una respuesta: procesar paquetes que estaban esperando
-            log_color(BLUE, f"ARP REPLY recibido: {arp_pkt.protosrc} tiene {arp_pkt.hwsrc}")
-            self._flush_pending(arp_pkt.protosrc)
-
-    def _send_arp_reply(self, req, reply_mac, out_port):
-        """Construye y envía un ARP reply."""
-        r            = arp()
-        r.opcode     = arp.REPLY
-        r.hwsrc      = reply_mac
-        r.hwdst      = req.hwsrc
-        r.protosrc   = req.protodst
-        r.protodst   = req.protosrc
-
-        e         = ethernet()
-        e.type    = ethernet.ARP_TYPE
-        e.src     = reply_mac
-        e.dst     = req.hwsrc
-        e.payload = r
-
-        msg        = of.ofp_packet_out()
-        msg.data   = e.pack()
-        msg.actions.append(of.ofp_action_output(port=out_port))
-        self.connection.send(msg)
-
-    def _send_arp_request(self, src_ip, src_mac, dst_ip, out_port):
-        """Envía un ARP request broadcast para resolver dst_ip."""
-        r            = arp()
-        r.opcode     = arp.REQUEST
-        r.hwsrc      = src_mac
-        r.hwdst      = EthAddr("ff:ff:ff:ff:ff:ff")
-        r.protosrc   = src_ip
-        r.protodst   = dst_ip
-
-        e         = ethernet()
-        e.type    = ethernet.ARP_TYPE
-        e.src     = src_mac
-        e.dst     = EthAddr("ff:ff:ff:ff:ff:ff")
-        e.payload = r
-
-        msg        = of.ofp_packet_out()
-        msg.data   = e.pack()
-        msg.actions.append(of.ofp_action_output(port=out_port))
-        self.connection.send(msg)
-        log_color(BLUE, f"ARP REQUEST enviado: ¿quién tiene {dst_ip}? (desde {src_ip})")
-
-    def _flush_pending(self, ip):
-        """Procesa paquetes que estaban esperando la MAC de 'ip'."""
-        if ip not in self.pending:
-            return
-        pkts = self.pending.pop(ip)
-        log_color(BLUE, f"Procesando {len(pkts)} paquete(s) pendiente(s) para {ip}")
-        for (pkt, in_port) in pkts:
-            self._process_outbound(pkt, pkt.payload, in_port)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  Manejo de IP
-    # ══════════════════════════════════════════════════════════════════════
-
-    def handle_ip(self, event):
-        pkt     = event.parsed
-        ip_pkt  = pkt.payload
-        in_port = event.port
-
-        log_color(YELLOW, f"IP: {ip_pkt.srcip} → {ip_pkt.dstip} | in_port={in_port}")
-
-        if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            # ── Paquete SALIENTE (de red privada hacia red pública) ──────
-            self._handle_outbound(pkt, ip_pkt, in_port)
-
-        elif ip_pkt.dstip == PUBLIC_IP:
-            # ── Paquete ENTRANTE (respuesta del servidor al NAT) ─────────
-            self._handle_inbound(pkt, ip_pkt, in_port)
-
-        else:
-            log_color(RED, f"Paquete descartado: {ip_pkt.srcip} → {ip_pkt.dstip} no aplica NAT")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Saliente: red privada → red pública
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _handle_outbound(self, pkt, ip_pkt, in_port):
-        proto    = ip_pkt.protocol
-        tcp_udp  = ip_pkt.payload
-
-        # ── ICMP OPCIONAL ── quitar el bloque marcado si no se quiere soporte ICMP ──
-        if proto == ipv4.ICMP_PROTOCOL:
-            icmp_pkt = ip_pkt.payload        # objeto icmp (type, code, csum)
-            echo_pkt = icmp_pkt.next         # objeto echo (id, seq)
-            src_port = echo_pkt.id           # el id del echo es el "puerto"
-            dst_ip   = ip_pkt.dstip
-            dst_port = 0                     # ICMP no tiene puerto destino
-        # ── FIN ICMP OPCIONAL ────────────────────────────────────────────────────
-        elif proto in (ipv4.TCP_PROTOCOL, ipv4.UDP_PROTOCOL):
-            src_port = tcp_udp.srcport
-            dst_ip   = ip_pkt.dstip
-            dst_port = tcp_udp.dstport
-        else:
-            log_color(RED, f"Protocolo {proto} no soportado por NAT (solo TCP/UDP)")
-            return
-
-        # ── Buscar o crear entrada NAT ────────────────────────────────────
-        nat_key = (proto, ip_pkt.srcip, src_port)
-        if nat_key not in self.nat_out:
-            if self.next_port > NAT_PORT_END:
-                log_color(RED, "Sin puertos NAT disponibles!")
+        elif eth.type == pkt.ethernet.IP_TYPE:
+            ip = eth.payload
+            if not isinstance(ip, pkt.ipv4):
+                log_color(RED, "Paquete IP no parseable, descartando")
                 return
-            pub_port = self.next_port
-            self.next_port += 1
-            self.nat_out[nat_key] = pub_port
-            self.nat_in[(proto, pub_port)] = (ip_pkt.srcip, src_port, in_port)
-            log_color(GREEN, f"Nueva entrada NAT: {ip_pkt.srcip}:{src_port} → {PUBLIC_IP}:{pub_port}")
-        else:
-            pub_port = self.nat_out[nat_key]
+            self._handle_ip(event.port, eth, ip, event.data)
 
-        # ── ¿Tenemos la MAC del destino público? ─────────────────────────
-        if dst_ip not in self.arp_table:
-            log_color(BLUE, f"MAC de {dst_ip} desconocida, encolando paquete y enviando ARP REQUEST")
-            self.pending.setdefault(dst_ip, []).append((pkt, in_port))
-            self._send_arp_request(PUBLIC_IP, PUBLIC_MAC, dst_ip, PUBLIC_PORT)
+        else:
+            log_color(YELLOW, f"Paquete ignorado: protocolo 0x{eth.type:04x}")
+
+    def _handle_FlowRemoved(self, event):
+        """Limpia la entrada NAT cuando un flujo expira en el switch."""
+        match = event.ofp.match
+        proto = match.nw_proto
+
+        if proto not in (pkt.ipv4.TCP_PROTOCOL, pkt.ipv4.UDP_PROTOCOL):
             return
 
-        self._process_outbound(pkt, ip_pkt, in_port)
+        # El flujo saliente tiene src=PUBLIC_IP
+        if match.nw_src == PUBLIC_IP and match.tp_src is not None:
+            self._nat_table.remove_entry(proto, match.tp_src)
 
-    def _process_outbound(self, pkt, ip_pkt, in_port):
-        """Traduce y reenvía un paquete saliente. Instala flujos en el switch."""
-        proto  = ip_pkt.protocol
-        dst_ip = ip_pkt.dstip
+    # ── Manejo de IP ───────────────────────────────────────────────────────
 
-        # ── ICMP OPCIONAL ── quitar el bloque marcado si no se quiere soporte ICMP ──
-        if proto == ipv4.ICMP_PROTOCOL:
-            src_port = ip_pkt.payload.next.id   # echo.id
-            dst_port = 0
-        # ── FIN ICMP OPCIONAL ────────────────────────────────────────────────────
+    def _handle_ip(self, in_port, eth, ip, raw_data):
+        if ip.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+            self._handle_outbound(in_port, eth, ip, raw_data)
+        elif ip.dstip == PUBLIC_IP:
+            self._handle_inbound(in_port, eth, ip)
         else:
-            src_port = ip_pkt.payload.srcport
-            dst_port = ip_pkt.payload.dstport
+            log_color(RED, f"Paquete descartado: {ip.srcip} → {ip.dstip} no aplica NAT")
 
-        nat_key  = (proto, ip_pkt.srcip, src_port)
-        pub_port = self.nat_out[nat_key]
+    # ── NAT saliente ───────────────────────────────────────────────────────
 
-        dst_mac, dst_switch_port = self.arp_table[dst_ip]
-
-        log_color(GREEN,
-            f"SALIENTE: {ip_pkt.srcip}:{src_port} → {dst_ip}:{dst_port} "
-            f"| NAT: {PUBLIC_IP}:{pub_port}")
-
-        # ── Instalar flujo SALIENTE en el switch ──────────────────────────
-        fm = of.ofp_flow_mod()
-        fm.idle_timeout = FLOW_TIMEOUT
-        fm.match.dl_type  = 0x0800
-        fm.match.nw_proto = proto
-        fm.match.nw_src   = ip_pkt.srcip
-        fm.match.nw_dst   = dst_ip
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm.match.tp_src = src_port
-            fm.match.tp_dst = dst_port
-        # Acciones: reescribir IP src, puerto src, MACs y enviar
-        fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm.actions.append(of.ofp_action_tp_port.set_src(pub_port))
-        fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-        fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-        fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
-        self.connection.send(fm)
-
-        # ── Instalar flujo ENTRANTE en el switch ──────────────────────────
-        priv_ip, priv_port, priv_switch_port = self.nat_in[(proto, pub_port)]
-
-        # Aprender la MAC del cliente privado del paquete que llegó
-        # (puede que no haya hecho ARP si tenía la MAC en caché)
-        if priv_ip not in self.arp_table:
-            self.arp_table[priv_ip] = (pkt.src, in_port)
-            log_color(BLUE, f"MAC de {priv_ip} aprendida del paquete: {pkt.src}")
-
-        priv_mac, _ = self.arp_table.get(priv_ip, (None, None))
-
-        if priv_mac is None:
-            log_color(RED, f"MAC de {priv_ip} no encontrada en tabla ARP, no se instala flujo entrante")
-            return
-
-        fm_back = of.ofp_flow_mod()
-        fm_back.idle_timeout = FLOW_TIMEOUT
-        fm_back.match.dl_type  = 0x0800
-        fm_back.match.nw_proto = proto
-        fm_back.match.nw_dst   = PUBLIC_IP
-        fm_back.match.in_port  = PUBLIC_PORT
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm_back.match.tp_dst = pub_port
-        # Acciones: reescribir IP dst, puerto dst, MACs y enviar
-        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(priv_ip))
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm_back.actions.append(of.ofp_action_tp_port.set_dst(priv_port))
-        fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-        fm_back.actions.append(of.ofp_action_dl_addr.set_dst(priv_mac))
-        fm_back.actions.append(of.ofp_action_output(port=priv_switch_port))
-        self.connection.send(fm_back)
-
-        # ── Reenviar el paquete actual (primero del flujo) ────────────────
-        ip_pkt.srcip = PUBLIC_IP
-        ip_pkt.csum  = 0
-
-        # ── ICMP OPCIONAL ── quitar el bloque marcado si no se quiere soporte ICMP ──
-        if proto == ipv4.ICMP_PROTOCOL:
-            ip_pkt.payload.next.id   = pub_port   # echo.id
-            ip_pkt.payload.next.csum = 0
-            ip_pkt.payload.csum      = 0
-        # ── FIN ICMP OPCIONAL ────────────────────────────────────────────────────
-        else:
-            tcp_udp         = ip_pkt.payload
-            tcp_udp.srcport = pub_port
-            tcp_udp.csum    = 0
-
-        pkt.src = PUBLIC_MAC
-        pkt.dst = dst_mac
-
-        msg = of.ofp_packet_out()
-        msg.data = pkt.pack()
-        msg.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
-        self.connection.send(msg)
-
-        log_color(CYAN,
-            f"ENVIADO: {PUBLIC_IP}:{pub_port} → {dst_ip}:{dst_port} | "
-            f"MAC: {PUBLIC_MAC} → {dst_mac}")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Entrante: red pública → NAT (respuesta del servidor)
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _handle_inbound(self, pkt, ip_pkt, in_port):
-        proto    = ip_pkt.protocol
-        tcp_udp  = ip_pkt.payload
-
-        # ── ICMP OPCIONAL ── quitar el bloque marcado si no se quiere soporte ICMP ──
-        if proto == ipv4.ICMP_PROTOCOL:
-            dst_port = ip_pkt.payload.next.id   # echo.id
-        # ── FIN ICMP OPCIONAL ────────────────────────────────────────────────────
-        elif proto in (ipv4.TCP_PROTOCOL, ipv4.UDP_PROTOCOL):
-            dst_port = tcp_udp.dstport
+    def _handle_outbound(self, in_port, eth, ip, raw_data):
+        proto = ip.protocol
+        if proto == pkt.ipv4.ICMP_PROTOCOL:
+            priv_port = ip.payload.next.id
+            dst_port  = 0
+        elif proto in (pkt.ipv4.TCP_PROTOCOL, pkt.ipv4.UDP_PROTOCOL):
+            priv_port = ip.payload.srcport
+            dst_port  = ip.payload.dstport
         else:
             log_color(RED, f"Protocolo {proto} no soportado por NAT (solo TCP/UDP)")
             return
-        nat_key  = (proto, dst_port)
 
-        if nat_key not in self.nat_in:
-            log_color(RED,
-                f"ENTRANTE sin entrada NAT: {ip_pkt.srcip} → {PUBLIC_IP}:{dst_port}, descartando")
+        priv_ip = ip.srcip
+        dst_ip  = ip.dstip
+
+        # Buscar o crear entrada NAT
+        pub_port = self._nat_table.get_public_port(proto, priv_ip, priv_port)
+        if pub_port is None:
+            pub_port = self._nat_table.add_entry(proto, priv_ip, priv_port, in_port)
+            if pub_port is None:
+                return  # sin puertos disponibles, error ya loggeado
+
+        # Resolver MAC del destino público
+        if not self._arp_handler.has_mac(dst_ip):
+            self._arp_handler.request_mac(dst_ip, in_port, raw_data)
             return
 
-        priv_ip, priv_port, priv_switch_port = self.nat_in[nat_key]
-        priv_mac_entry = self.arp_table.get(priv_ip)
+        dst_mac, _ = self._arp_handler.get_mac(dst_ip)
 
-        if priv_mac_entry is None:
+        # Aprender MAC del host privado si no la tenemos
+        if not self._arp_handler.has_mac(priv_ip):
+            self._arp_handler.arp_table[priv_ip] = (eth.src, in_port)
+            log.info("MAC de %s aprendida del paquete: %s", priv_ip, eth.src)
+
+        priv_mac, priv_sw_port = self._arp_handler.get_mac(priv_ip)
+
+        # Instalar flujos en el switch
+        self._flow_mgr.install_outbound(proto,
+                                         priv_ip, priv_port,
+                                         dst_ip,  dst_port,
+                                         pub_port, dst_mac)
+        self._flow_mgr.install_inbound(proto,
+                                        pub_port,
+                                        dst_ip, dst_port,
+                                        priv_ip, priv_port,
+                                        priv_mac, priv_sw_port)
+
+        # Traducir y reenviar el primer paquete manualmente
+        self._forward_outbound(eth, ip, dst_ip, dst_port,
+                                proto, pub_port, dst_mac)
+
+    def _forward_outbound(self, eth, ip, dst_ip, dst_port,
+                           proto, pub_port, dst_mac):
+        """Traduce y reenvía el primer paquete saliente."""
+        ip.srcip = PUBLIC_IP
+        ip.csum  = 0
+
+        if proto == pkt.ipv4.ICMP_PROTOCOL:
+            ip.payload.next.id   = pub_port
+            ip.payload.next.csum = 0
+            ip.payload.csum      = 0
+        else:
+            ip.payload.srcport = pub_port
+            ip.payload.csum    = 0
+
+        eth.src = PUBLIC_MAC
+        eth.dst = dst_mac
+
+        self._send_packet(eth.pack(), PUBLIC_PORT)
+        log_color(CYAN, f"ENVIADO: {PUBLIC_IP}:{pub_port} → {dst_ip}:{dst_port} | MAC: {PUBLIC_MAC} → {dst_mac}")
+
+    # ── NAT entrante ───────────────────────────────────────────────────────
+
+    def _handle_inbound(self, in_port, eth, ip):
+        proto = ip.protocol
+        if proto == pkt.ipv4.ICMP_PROTOCOL:
+            pub_port = ip.payload.next.id
+        elif proto in (pkt.ipv4.TCP_PROTOCOL, pkt.ipv4.UDP_PROTOCOL):
+            pub_port = ip.payload.dstport
+        else:
+            log_color(RED, f"Protocolo {proto} no soportado, descartando")
+            return
+
+        entry = self._nat_table.get_private_info(proto, pub_port)
+        if entry is None:
+            log_color(RED, f"ENTRANTE sin entrada NAT: pub_port={pub_port}, descartando")
+            return
+
+        priv_ip, priv_port, priv_sw_port = entry
+        mac_entry = self._arp_handler.get_mac(priv_ip)
+        if mac_entry is None:
             log_color(RED, f"MAC de {priv_ip} no encontrada, descartando paquete entrante")
             return
 
-        priv_mac, _ = priv_mac_entry
+        priv_mac, _ = mac_entry
+        self._forward_inbound(eth, ip, proto, priv_ip, priv_port,
+                               priv_mac, priv_sw_port)
 
-        src_info = ip_pkt.payload.next.id if proto == ipv4.ICMP_PROTOCOL else tcp_udp.srcport
-        log_color(GREEN,
-            f"ENTRANTE: {ip_pkt.srcip}:{src_info} → {PUBLIC_IP}:{dst_port} "
-            f"| NAT inverso → {priv_ip}:{priv_port}")
+    def _forward_inbound(self, eth, ip, proto,
+                          priv_ip, priv_port, priv_mac, priv_sw_port):
+        """Traduce y reenvía el primer paquete entrante."""
+        ip.dstip = priv_ip
+        ip.csum  = 0
 
-        # ── Instalar flujo ENTRANTE en el switch ──────────────────────────
-        fm_back = of.ofp_flow_mod()
-        fm_back.idle_timeout = FLOW_TIMEOUT
-        fm_back.match.dl_type  = 0x0800
-        fm_back.match.nw_proto = proto
-        fm_back.match.nw_src   = ip_pkt.srcip
-        fm_back.match.nw_dst   = PUBLIC_IP
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm_back.match.tp_src = src_info
-            fm_back.match.tp_dst = dst_port
-        fm_back.match.in_port  = PUBLIC_PORT
-        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(priv_ip))
-        if proto != ipv4.ICMP_PROTOCOL:
-            fm_back.actions.append(of.ofp_action_tp_port.set_dst(priv_port))
-        fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-        fm_back.actions.append(of.ofp_action_dl_addr.set_dst(priv_mac))
-        fm_back.actions.append(of.ofp_action_output(port=priv_switch_port))
-        self.connection.send(fm_back)
-
-        # Traducir y reenviar el paquete actual (primero del flujo)
-        ip_pkt.dstip = priv_ip
-        ip_pkt.csum  = 0
-
-        # ── ICMP OPCIONAL ── quitar el bloque marcado si no se quiere soporte ICMP ──
-        if proto == ipv4.ICMP_PROTOCOL:
-            ip_pkt.payload.next.id   = priv_port   # echo.id
-            ip_pkt.payload.next.csum = 0
-            ip_pkt.payload.csum      = 0
-        # ── FIN ICMP OPCIONAL ────────────────────────────────────────────────────
+        if proto == pkt.ipv4.ICMP_PROTOCOL:
+            ip.payload.next.id   = priv_port
+            ip.payload.next.csum = 0
+            ip.payload.csum      = 0
         else:
-            tcp_udp         = ip_pkt.payload
-            tcp_udp.dstport = priv_port
-            tcp_udp.csum    = 0
+            ip.payload.dstport = priv_port
+            ip.payload.csum    = 0
 
-        pkt.src = PRIVATE_MAC
-        pkt.dst = priv_mac
+        eth.src = PRIVATE_MAC
+        eth.dst = priv_mac
 
+        self._send_packet(eth.pack(), priv_sw_port)
+        log_color(CYAN, f"ENVIADO: {priv_ip}:{priv_port} | MAC: {PRIVATE_MAC} → {priv_mac}")
+
+    # ── Callback de ARP resuelto ───────────────────────────────────────────
+
+    def _on_mac_resolved(self, in_port, raw_data):
+        """
+        Llamado por ARPHandler cuando se resuelve una MAC pendiente.
+        Reinyecta el paquete para que sea procesado ahora que la MAC está disponible.
+        """
+        eth = pkt.ethernet(raw=raw_data)
+        if eth.type != pkt.ethernet.IP_TYPE:
+            return
+        ip = eth.payload
+        if not isinstance(ip, pkt.ipv4):
+            return
+        self._handle_ip(in_port, eth, ip, raw_data)
+
+    # ── Envío ──────────────────────────────────────────────────────────────
+
+    def _send_packet(self, data, out_port):
         msg = of.ofp_packet_out()
-        msg.data = pkt.pack()
-        msg.actions.append(of.ofp_action_output(port=priv_switch_port))
-        self.connection.send(msg)
-
-        log_color(CYAN,
-            f"ENVIADO: {priv_ip}:{priv_port} | MAC: {PRIVATE_MAC} → {priv_mac}")
+        msg.data = data
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        self._connection.send(msg)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Launch
-# ══════════════════════════════════════════════════════════════════════════
+# ── Launch ─────────────────────────────────────────────────────────────────
 
 def launch():
     def start_switch(event):
-        log_color(YELLOW, f"Iniciando ProtoRouter (NAT/PAT) para Switch {event.connection.dpid}")
+        log.info("Iniciando ProtoRouter para switch %s", event.connection.dpid)
         ProtoRouter(event.connection)
 
     core.openflow.addListenerByName("ConnectionUp", start_switch)
