@@ -63,7 +63,12 @@ class NATTopo(Topo):
 
 def run():
     topo = NATTopo()
-    net  = Mininet(topo=topo, controller=RemoteController, link=TCLink)
+    # POX (OpenFlow 1.0) escucha en 6633; Mininet reciente intenta 6653 por defecto.
+    net = Mininet(
+        topo=topo,
+        controller=lambda name: RemoteController(name, port=6633),
+        link=TCLink,
+    )
     net.start()
 
     # ── Deshabilitar IPv6 en hosts y switch ────────────────────────────────
