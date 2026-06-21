@@ -1,21 +1,26 @@
-Cómo correr:
+### Cómo correr
 
-en 1ra terminal parado en tp2-sdn-nat/pox/
-
-´´´
+#### 1. En la primera terminal (parado en `tp2-sdn-nat/pox/`)
+```bash
 python3 pox.py log.level --DEBUG protorouter
-´´´
+```
 
-en 2da terminal parado en tp_sdn_nat/
-
-´´´
+#### 2. En la segunda terminal (parado en `tp_sdn_nat/`)
+```bash
 sudo python3 topo.py
-´´´
+```
 
-después puse poner en mininet> 
-
-´´´
+#### 3. En la CLI de Mininet (ejecutar desde la terminal donde quedó la topología)
+```bash
 h2 ping h1
-´´´
-//ctrl+c para parar el ping
-//salir de Mininet: "exit" 
+```
+
+**Detener el ping**
+```bash
+# presionar Ctrl+C en la CLI de Mininet
+```
+
+**Salir de Mininet**
+```bash
+exit
+```
