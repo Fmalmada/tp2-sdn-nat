@@ -32,14 +32,26 @@ class NATTopo(Topo):
     def build(self):
         s1 = self.addSwitch('s1')
 
-        h1 = self.addHost('h1', ip='200.0.0.1/24',
-                          mac='00:00:00:00:00:01', defaultRoute='via 200.0.0.254')
+        # ── Red pública ───────────────────────────────────────────────────
+        h1 = self.addHost(
+            'h1', 
+            ip='200.0.0.1/24',
+            mac='00:00:00:00:00:01', 
+            defaultRoute='via 200.0.0.254'
+        )
 
-        h2 = self.addHost('h2', ip='192.168.1.2/24', mac='00:00:00:00:00:02',
-                          defaultRoute='via 192.168.1.254')
+        # ── Red privada ───────────────────────────────────────────────────
+        h2 = self.addHost(
+                'h2', 
+                ip='192.168.1.2/24', 
+                mac='00:00:00:00:00:02',
+                defaultRoute='via 192.168.1.254'
+        )
 
-        self.addLink(h1, s1)
-        self.addLink(h2, s1)
+        # ── Links ──────────────────────────────────────────────────────────
+        # IMPORTANTE: h1 debe conectarse al puerto 1 del switch (PUBLIC_PORT = 1)
+        self.addLink(h1, s1) # → port 1 (público)
+        self.addLink(h2, s1) # → port 2 (privado)
 
 
 def run():
@@ -47,21 +59,18 @@ def run():
     net = Mininet(topo=topo, controller=RemoteController, link=TCLink)
     net.start()
 
-    # Deshabilita IPv6 en hosts
+    # ── Deshabilitar IPv6 en hosts y switch ────────────────────────────────
     for host in net.hosts:
         host.cmd("sysctl -w net.ipv6.conf.all.disable_ipv6=1")
         host.cmd("sysctl -w net.ipv6.conf.default.disable_ipv6=1")
         host.cmd("sysctl -w net.ipv6.conf.lo.disable_ipv6=1")
 
-    # Deshabilita IPv6 en switch
     s1 = net.get('s1')
     s1.cmd("sysctl -w net.ipv6.conf.all.disable_ipv6=1")
     s1.cmd("sysctl -w net.ipv6.conf.default.disable_ipv6=1")
     s1.cmd("sysctl -w net.ipv6.conf.lo.disable_ipv6=1")
 
-    # Entradas ARP para debug (TODO: Usar Protocolo ARP)
-    net.get('h1').setARP('200.0.0.254', '00:00:00:aa:aa:aa')
-    net.get('h2').setARP('192.168.1.254', '00:00:00:bb:bb:bb')
+    # ── SIN entradas ARP estáticas: todo se resuelve dinámicamente ─────────
 
     CLI(net)
     net.stop()
