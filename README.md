@@ -10,10 +10,10 @@ python3 pox.py log.level --DEBUG protorouter
 sudo python3 topo.py
 ```
 
-Para probar la **Etapa 1 (ARP Dinámico)**, ejecutar cómo siempre en 2 terminales separadas. 
 
+### 🧪 Pruebas de **Etapa 1 (ARP Dinámico)**, dentro de la CLI de Mininet (Terminal 2)
 
-### 🧪 Pruebas dentro de la CLI de Mininet (Terminal 2)
+Ejecuta las siguientes instrucciones dentro de la terminal de Mininet para comprobar el comportamiento dinámico:
 
 Ejecuta las siguientes instrucciones dentro de la terminal de Mininet para comprobar el comportamiento dinámico:
 
@@ -97,6 +97,36 @@ Si quisieras obligar a h1 a aprender la MAC del switch desde el primer Request y
 ```bash
 h1 sysctl -w net.ipv4.conf.all.arp_accept=1
 ```
+
+### 🧪 Pruebas de **Etapa 2 (NAT sin PAT)**, dentro de la CLI de Mininet (Terminal 2)
+
+1. En la consola de Mininet, abre las terminales (shift+insert para pegar):
+```bash
+xterm h1 h2
+```
+
+
+2. Te aparecerán dos ventanas independientes de fondo negro (una para `h1` y otra para `h2`).
+3. En la ventana de **`h1`** (el host público), pon a escuchar el tráfico de red:
+```bash
+tcpdump -i h1-eth0 -n icmp
+```
+
+
+4. En la ventana de **`h2`** (el host privado), lanza el ping:
+```bash
+ping -c 2 200.0.0.1
+```
+
+### 🔍 ¿Qué debes observar en la ventana de `h1`?
+
+Deberías ver algo así:
+
+```text
+200.0.0.254 > 200.0.0.1: ICMP echo request, id 1234, seq 1 ...
+200.0.0.1 > 200.0.0.254: ICMP echo reply, id 1234, seq 1 ...
+```
+
 
 **Salir de Mininet**
 ```bash

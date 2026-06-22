@@ -18,7 +18,7 @@ def log_color(color, msg):
     log.info(f"{color}{msg}{RESET}")
 
 # ──────────────────────────────────────────────
-#  Configuración de red (sin valores hardcodeados de hosts)
+#  Configuración de red (sin valores hardcodeados)
 # ──────────────────────────────────────────────
 PRIVATE_SUBNET = IPAddr("192.168.1.0")      # Red interna
 PRIVATE_MASK = 24                           # Máscara de la red interna
@@ -42,7 +42,7 @@ class ProtoRouter(object):
         # ip_destino -> [(packet_ethernet, in_port), ...]
         self.pending = {}
 
-        log_color(YELLOW, "ProtoRouter (con ARP dinámico) iniciado.")
+        log_color(YELLOW, "ProtoRouter (con ARP dinámico y NAT) iniciado.")
 
     # ══════════════════════════════════════════════════════════════════════
     #  Dispatcher principal
@@ -65,12 +65,13 @@ class ProtoRouter(object):
     # ══════════════════════════════════════════════════════════════════════
     #  Manejo de ARP
     # ══════════════════════════════════════════════════════════════════════
+    
     def handle_arp(self, event):
         pkt     = event.parsed
         arp_pkt = pkt.payload
         in_port = event.port
 
-        # Aprender siempre la MAC del remitente y su puerto asociado
+        # Aprender siempre la MAC del remitente
         self.arp_table[arp_pkt.protosrc] = (arp_pkt.hwsrc, in_port)
         log_color(BLUE, f"ARP aprendido: {arp_pkt.protosrc} → {arp_pkt.hwsrc} (port {in_port})")
 
@@ -141,18 +142,19 @@ class ProtoRouter(object):
         pkts = self.pending.pop(ip)
         log_color(BLUE, f"Procesando {len(pkts)} paquete(s) pendiente(s) para {ip}")
         for (pkt, in_port) in pkts:
+            # CORRECCIÓN: Volvemos a procesar el paquete IP ahora que conocemos su MAC destino
             self._process_ip(pkt, in_port)
-
+     
     # ══════════════════════════════════════════════════════════════════════
-    #  Manejo de IP
+    #  Manejo de IP & NAT (Sin PAT)
     # ══════════════════════════════════════════════════════════════════════
     
     def handle_ip(self, event):
-        """Punto de entrada para paquetes IP recibidos."""
+        """Punto de entrada de paquetes IP desde el PacketIn."""
         self._process_ip(event.parsed, event.port)
 
     def _process_ip(self, packet, in_port):
-        """Efectúa la lógica de ruteo e instalación de flujos con ARP dinámico."""
+        """Efectúa la lógica de ruteo, instalación de flujos con NAT y ARP dinámico."""
         ip_pkt = packet.payload
 
         log_color(
@@ -179,7 +181,7 @@ class ProtoRouter(object):
                 self._send_arp_request(src_ip=PUBLIC_IP, src_mac=PUBLIC_MAC, dst_ip=dst_ip, out_port=PUBLIC_PORT)
                 return
 
-            # Instalar Flujo Saliente
+            # ── 1. INSTALAR FLUJO SALIENTE (Aplica NAT de Origen) ───────────
             fm = of.ofp_flow_mod()
             fm.idle_timeout = 10
 
@@ -189,34 +191,46 @@ class ProtoRouter(object):
             fm.match.in_port = in_port
 
             # Acción (Saliente)
+            # NAT: Modificamos la IP de origen privada por la IP pública del switch
+            fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
             fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
             fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))  # MAC dinámica obtenida por ARP
             fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
             self.connection.send(fm)
 
-            # Instalar Flujo Entrante (para respuesta)
+            # ── 2. INSTALAR FLUJO ENTRANTE (Aplica NAT de Destino) ──────────
             fm_back = of.ofp_flow_mod()
             fm_back.idle_timeout = 10
 
             # Filtro (Entrante)
             fm_back.match.nw_src = ip_pkt.dstip
-            fm_back.match.nw_dst = ip_pkt.srcip
+            # El host externo responderá a la IP pública del switch, no a la privada
+            fm_back.match.nw_dst = PUBLIC_IP
             fm_back.match.dl_type = 0x800  # IPv4
             fm_back.match.in_port = PUBLIC_PORT
 
             # Acción (Entrante)
+            # NAT: Modificamos la IP de destino pública de vuelta a la IP privada del host original
+            fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ip_pkt.srcip))
             fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
             fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
             fm_back.actions.append(of.ofp_action_output(port=in_port))
             self.connection.send(fm_back)
 
-            # Reenviar paquete actual con MACs actualizadas (Los posteriores pasan por flujo)
+            # ── 3. REENVIAR PRIMER PAQUETE (Packet Out manual con NAT) ─────
+            orig_srcip = ip_pkt.srcip
+            
+            # Modificamos los campos del objeto en Python (POX recalcula el checksum automáticamente)
+            ip_pkt.srcip = PUBLIC_IP
             packet.src = PUBLIC_MAC
             packet.dst = dst_mac
+            
             msg = of.ofp_packet_out()
             msg.data = packet.pack()
             msg.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
-            log_color(CYAN, f"ENVIANDO: {ip_pkt.srcip} → {ip_pkt.dstip} | MAC: {PUBLIC_MAC} → {dst_mac} | Out Port: {PUBLIC_PORT}")
+            
+            log_color(CYAN, f"ENVIANDO (NAT): {orig_srcip} (NAT a {PUBLIC_IP}) → {ip_pkt.dstip} | "
+                            f"MAC: {PUBLIC_MAC} → {dst_mac} | Out Port: {PUBLIC_PORT}")
             self.connection.send(msg)
 
         else:
