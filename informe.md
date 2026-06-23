@@ -22,9 +22,9 @@ La arquitectura final se descompone en cuatro módulos:
 ```
               Red Pública                    Red Privada
               port 1                         port 2, 3, 4
- ┌───────┐   IP:  200.0.0.254        ┌──────┐  IP: 192.168.1.254     ┌───────┐
+ ┌───────┐   IP:  200.0.0.254          ┌──────┐  IP: 192.168.1.254   ┌───────┐
  │  h1   ├───────────────────────────/ s1  \──────────────────────── │  h2   │
- └───────┘                           └──────┘                        └───────┘
+ └───────┘                           └──────┘                         └───────┘
  200.0.0.1/24                     NAT Switch                     192.168.1.2/24
  DG: 200.0.0.254                                                      ┌───────┐
  MAC: 00:00:00:00:00:01                                               │  h3   │
@@ -197,24 +197,41 @@ curl -v http://200.0.0.1:8081/
 
 ### 6.2 TCP simultáneo
 
-Verifica múltiples conexiones TCP concurrentes al mismo servidor.
+Verifica múltiples conexiones TCP activas al mismo tiempo. Se usa `iperf` en modo TCP con duración larga para garantizar solapamiento real.
 
-**xterm h1** — levantar servidor:
+**xterm h1** — levantar servidor iperf TCP:
 ```bash
-python3 -m http.server 8082
+iperf -s -p 5010
 ```
 
 **xterm h2** (lanzar en background):
 ```bash
-curl -s --max-time 15 -o /dev/null -w '%{http_code}\n' http://200.0.0.1:8082/ &
+iperf -c 200.0.0.1 -p 5010 -t 15 > /tmp/tcp_h2.txt &
 ```
 
-**xterm h3** (lanzar inmediatamente):
+**xterm h3** (lanzar inmediatamente después):
 ```bash
-curl -s --max-time 15 -o /dev/null -w '%{http_code}\n' http://200.0.0.1:8082/ &
+iperf -c 200.0.0.1 -p 5010 -t 15 > /tmp/tcp_h3.txt &
 ```
 
-**Resultado esperado:** ambos imprimen `200`.
+Mientras corren, verificar desde la **CLI de Mininet** que hay dos flujos TCP activos al mismo tiempo:
+```bash
+ovs-ofctl dump-flows s1
+```
+
+Deben aparecer entradas con `nw_src=192.168.1.2` y `nw_src=192.168.1.3` simultáneamente. Luego de ~20 segundos verificar:
+
+**xterm h2:**
+```bash
+cat /tmp/tcp_h2.txt
+```
+
+**xterm h3:**
+```bash
+cat /tmp/tcp_h3.txt
+```
+
+**Resultado esperado:** ambos archivos muestran transferencia con `Mbits/sec`.
 
 ---
 
@@ -250,24 +267,29 @@ iperf -c 200.0.0.1 -u -p 5002 -t 4
 
 ### 6.4 UDP simultáneo
 
-Verifica múltiples flujos UDP concurrentes.
+Verifica múltiples flujos UDP activos al mismo tiempo. Se aumenta la duración para garantizar solapamiento real.
 
-**xterm h1** — levantar servidor:
+**xterm h1** — levantar servidor iperf UDP:
 ```bash
 iperf -s -u -p 5003
 ```
 
 **xterm h2** (lanzar en background):
 ```bash
-iperf -c 200.0.0.1 -u -p 5003 -t 6 > /tmp/udp_h2.txt &
+iperf -c 200.0.0.1 -u -p 5003 -t 15 > /tmp/udp_h2.txt &
 ```
 
-**xterm h3** (lanzar inmediatamente):
+**xterm h3** (lanzar inmediatamente después):
 ```bash
-iperf -c 200.0.0.1 -u -p 5003 -t 6 > /tmp/udp_h3.txt &
+iperf -c 200.0.0.1 -u -p 5003 -t 15 > /tmp/udp_h3.txt &
 ```
 
-Esperar y verificar resultados:
+Mientras corren, verificar desde la **CLI de Mininet** que hay dos flujos UDP activos al mismo tiempo:
+```bash
+ovs-ofctl dump-flows s1
+```
+
+Deben aparecer entradas con `nw_src=192.168.1.2` y `nw_src=192.168.1.3` simultáneamente. Luego de ~20 segundos verificar:
 
 **xterm h2:**
 ```bash
