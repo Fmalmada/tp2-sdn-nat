@@ -8,24 +8,23 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel
 
 
-#                                      Tráfico Saliente
 #
-#                                      <---------------
+#                           Red Pública                    Red Privada
 #
-#                           Red Pública                Red Privada
-#
-#
-#                              port 1                     port 2
-#        ┌───────┐     IP:  200.0.0.254        /\  IP: 192.168.1.254          ┌───────┐
-#        │       │     MAC: 00.00.00.aa.aa.aa /  \ MAC:00.00.00.bb.bb.bb      │       │
-#        │  h1   ├───────────────────────────/ s1 \───────────────────────────│  h2   │
-#        └───────┘                           \    /                           └───────┘
-#       /       /                             \  /                           /       /
-#      ─────────                               \/                           ─────────
-#  IP:  200.0.0.1/24                                                    IP:  192.168.1.2/24
-#  DG:  200.0.0.254                                                     DG:  192.168.1.254
-#  MAC: 00:00:00:00:00:01                                               MAC: 00:00:00:00:00:02
-#
+#                              port 1                         port 2, 3, 4
+#        ┌───────┐      IP:  200.0.0.254          /\  IP: 192.168.1.254     ┌───────┐
+#        │       │      MAC: 00.00.00.aa.aa.aa   /  \ MAC:00.00.00.bb.bb.bb │       │
+#        │  h1   ├─────────────────────────────/ s1  \────────────────────── │  h2   │
+#        └───────┘                             \      /                      └───────┘
+#    IP:  200.0.0.1/24                          \    /                   IP:  192.168.1.2/24
+#    DG:  200.0.0.254                            \  /                    DG:  192.168.1.254
+#    MAC: 00:00:00:00:00:01                       \/                     MAC: 00:00:00:00:00:02
+#                                                                             ┌───────┐
+#                                                                             │  h3   │
+#                                                                             └───────┘
+#                                                                         IP:  192.168.1.3/24
+#                                                                         DG:  192.168.1.254
+#                                                                         MAC: 00:00:00:00:00:03
 
 
 class NATTopo(Topo):
@@ -34,29 +33,37 @@ class NATTopo(Topo):
 
         # ── Red pública ───────────────────────────────────────────────────
         h1 = self.addHost(
-            'h1', 
+            'h1',
             ip='200.0.0.1/24',
-            mac='00:00:00:00:00:01', 
+            mac='00:00:00:00:00:01',
             defaultRoute='via 200.0.0.254'
         )
 
         # ── Red privada ───────────────────────────────────────────────────
         h2 = self.addHost(
-                'h2', 
-                ip='192.168.1.2/24', 
-                mac='00:00:00:00:00:02',
-                defaultRoute='via 192.168.1.254'
+            'h2',
+            ip='192.168.1.2/24',
+            mac='00:00:00:00:00:02',
+            defaultRoute='via 192.168.1.254'
+        )
+
+        h3 = self.addHost(
+            'h3',
+            ip='192.168.1.3/24',
+            mac='00:00:00:00:00:03',
+            defaultRoute='via 192.168.1.254'
         )
 
         # ── Links ──────────────────────────────────────────────────────────
         # IMPORTANTE: h1 debe conectarse al puerto 1 del switch (PUBLIC_PORT = 1)
-        self.addLink(h1, s1) # → port 1 (público)
-        self.addLink(h2, s1) # → port 2 (privado)
+        self.addLink(h1, s1)   # → port 1 (público)
+        self.addLink(h2, s1)   # → port 2 (privado)
+        self.addLink(h3, s1)   # → port 3 (privado)
 
 
 def run():
     topo = NATTopo()
-    net = Mininet(topo=topo, controller=RemoteController, link=TCLink)
+    net  = Mininet(topo=topo, controller=RemoteController, link=TCLink)
     net.start()
 
     # ── Deshabilitar IPv6 en hosts y switch ────────────────────────────────

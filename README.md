@@ -175,6 +175,27 @@ nc 200.0.0.1 8080
 3. **Acción:** Cerrar inmediatamente `h2` con `Ctrl + C`.
 4. **Verificación:** Revisar la consola de POX; en 120 segundos aparecerá el log rojo `[GC]` liberando el puerto.
 
+### Comandos Rápidos - Etapa 5 (Multihost)
+
+**1. En la consola de Mininet (Abrir terminales):**
+
+```bash
+xterm h1 h1 h2 h3
+
+```
+
+**2. En las ventanas de h1 (Servidores públicos):**
+
+* **Ventana 1:** `nc -lnvp 8080 -n`
+* **Ventana 2:** `nc -lnvp 8081 -n`
+
+**3. En los clientes privados (Conexión simultánea):**
+
+* **Ventana de h2:** `nc 200.0.0.1 8080`
+* **Ventana de h3:** `nc 200.0.0.1 8081`
+
+**Verificación:** Envía texto desde ambos. En POX verás crearse en paralelo los puertos `10000` (para `h2`) y `10001` (para `h3`) sin pisarse, mandar un solo numero de preferencia en mensajes.
+
 **Salir de Mininet**
 ```bash
 exit
