@@ -159,6 +159,21 @@ nc 200.0.0.1 8080
 ---
 
 
+# Comandos Rápidos - Etapa 4
+
+## Prueba A: Inactividad UDP (Timeout de 30s)
+1. **h1 (Servidor):** `nc -lnup 9000 -n`
+2. **h2 (Cliente):** `nc -u 200.0.0.1 9000`
+3. **Acción:** Enviar mensaje, dar `Enter` y cerrar `h2` con `Ctrl + C`. 
+4. **Verificación:** Esperar 30 segundos a que POX muestre el log rojo `[GC]` de liberación.
+
+---
+
+## Prueba B: Cierre Rápido TCP (Flags / Máx 120s)
+1. **h1 (Servidor):** `nc -lnvp 8080 -n`
+2. **h2 (Cliente):** `nc 200.0.0.1 8080`
+3. **Acción:** Cerrar inmediatamente `h2` con `Ctrl + C`.
+4. **Verificación:** Revisar la consola de POX; en 120 segundos aparecerá el log rojo `[GC]` liberando el puerto.
 
 **Salir de Mininet**
 ```bash

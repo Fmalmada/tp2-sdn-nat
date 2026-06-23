@@ -1,12 +1,16 @@
 # Import some POX stuff
-from pox.core import core                       # Main POX object
-import pox.openflow.libopenflow_01 as of        # OpenFlow 1.0 library
-from pox.lib.addresses import EthAddr, IPAddr   # Address types
+from pox.core import core                       
+import pox.openflow.libopenflow_01 as of        
+from pox.lib.addresses import EthAddr, IPAddr   
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
-from pox.lib.packet.ipv4 import ipv4            # Para detectar protocolos L4
-from pox.lib.packet.tcp import tcp              # Para extraer puertos TCP
-from pox.lib.packet.udp import udp              # Para extraer puertos UDP
+from pox.lib.packet.ipv4 import ipv4            
+from pox.lib.packet.tcp import tcp              
+from pox.lib.packet.udp import udp              
+from pox.lib.recoco import Timer                # Para el Garbage Collector
+import time                                     # Para los timestamps
+
+ipv4.ipv4 = ipv4
 
 log = core.getLogger()
 RED    = "\033[31m"
@@ -15,7 +19,6 @@ YELLOW = "\033[33m"
 CYAN   = "\033[36m"
 BLUE   = "\033[34m"
 RESET  = "\033[0m"
-
 
 def log_color(color, msg):
     log.info(f"{color}{msg}{RESET}")
@@ -31,10 +34,12 @@ PUBLIC_MAC = EthAddr("00:00:00:aa:aa:aa")
 PRIVATE_MAC = EthAddr("00:00:00:bb:bb:bb")  
 PUBLIC_PORT = 1                             
 
-# ── Constantes PAT ──────────────────────────────────────────────
-NAT_PORT_START = 10000                     # Primer puerto público a asignar
-NAT_PORT_END   = 65535                     # Último puerto público a asignar
-FLOW_TIMEOUT   = 60                        # Segundos de inactividad antes de expirar flujo
+# ── Constantes PAT y Tiempos ────────────────────────────────────
+NAT_PORT_START = 10000                     
+NAT_PORT_END   = 65535                     
+FLOW_TIMEOUT   = 20                        # Reducido para que el controlador vea el tráfico más seguido
+UDP_TIMEOUT    = 30                        # Segundos para expirar conexiones UDP inactivas
+TCP_TIMEOUT    = 120                       # Segundos para expirar conexiones TCP inactivas
 
 class ProtoRouter(object):
     def __init__(self, connection):
@@ -45,18 +50,71 @@ class ProtoRouter(object):
         self.arp_table = {}  # ip -> (mac, in_port)
         self.pending = {}    # ip_destino -> [(packet_ethernet, in_port), ...]
 
-        # ── Tablas NAT (PAT) ────────────────────────────────────────────
-        # Saliente: (proto, ip_privada, puerto_privado) -> puerto_publico
+        # ── Tablas NAT con Estado (Etapa 4) ─────────────────────────────
+        # nat_out: (proto, ip_privada, puerto_privado) -> {'pub_port': int, 'state': str, 'last_active': float}
         self.nat_out = {}
-        # Entrante: (proto, puerto_publico) -> (ip_privada, puerto_privado, in_port)
+        # nat_in: (proto, puerto_publico) -> {'ip_priv': IPAddr, 'port_priv': int, 'in_port': int}
         self.nat_in  = {}
-        # Próximo puerto público disponible
+        
         self.next_port = NAT_PORT_START
 
-        log_color(YELLOW, "ProtoRouter (con ARP dinámico y PAT) iniciado.")
+        # Iniciar el Garbage Collector cada 5 segundos
+        Timer(5, self._clean_expired_connections, recurring=True)
+
+        log_color(YELLOW, "ProtoRouter (con ARP, PAT y Connection Tracking) iniciado.")
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Dispatcher principal
+    #  Garbage Collector (Limpieza de Estado)
+    # ══════════════════════════════════════════════════════════════════════
+    
+    def _clean_expired_connections(self):
+        """Revisa la tabla de conexiones y elimina las expiradas o cerradas."""
+        now = time.time()
+        # Usamos list() para no modificar el diccionario mientras lo iteramos
+        keys_to_delete = []
+
+        for key_out, data in self.nat_out.items():
+            proto, priv_ip, priv_port = key_out
+            time_idle = now - data['last_active']
+            state = data['state']
+            
+            # Condición 1: TCP cerrado
+            if proto == ipv4.TCP_PROTOCOL and state == 'CLOSED':
+                keys_to_delete.append(key_out)
+            # Condición 2: Timeout general TCP
+            elif proto == ipv4.TCP_PROTOCOL and time_idle > TCP_TIMEOUT:
+                keys_to_delete.append(key_out)
+            # Condición 3: Timeout UDP
+            elif proto == ipv4.UDP_PROTOCOL and time_idle > UDP_TIMEOUT:
+                keys_to_delete.append(key_out)
+
+        for key_out in keys_to_delete:
+            proto = key_out[0]
+            pub_port = self.nat_out[key_out]['pub_port']
+            key_in = (proto, pub_port)
+            
+            # Limpiar ambas tablas
+            del self.nat_out[key_out]
+            if key_in in self.nat_in:
+                del self.nat_in[key_in]
+                
+            log_color(RED, f"[GC] Conexión {key_out[1]}:{key_out[2]} expirada/cerrada. Puerto {pub_port} liberado.")
+
+    def _update_tcp_state(self, data, tcp_pkt):
+        """Actualiza el estado de una conexión TCP en base a sus flags."""
+        if tcp_pkt.RST:
+            data['state'] = 'CLOSED'
+        elif tcp_pkt.FIN:
+            # Simplificación: si vemos un FIN, marcamos en proceso de cierre.
+            # En un NAT estricto validaríamos el FIN de ambas direcciones.
+            data['state'] = 'CLOSING'
+        elif tcp_pkt.SYN and tcp_pkt.ACK:
+            data['state'] = 'ESTABLISHED'
+        elif tcp_pkt.SYN:
+            data['state'] = 'SYN_SENT'
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Dispatcher y ARP (Sin cambios estructurales)
     # ══════════════════════════════════════════════════════════════════════
 
     def _handle_PacketIn(self, event):
@@ -69,20 +127,13 @@ class ProtoRouter(object):
             self.handle_arp(event)
         elif pkt.type == ethernet.IP_TYPE:
             self.handle_ip(event)
-        else:
-            log_color(YELLOW, f"Paquete ignorado: protocolo 0x{pkt.type:04x}")
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  Manejo de ARP
-    # ══════════════════════════════════════════════════════════════════════
-    
     def handle_arp(self, event):
         pkt     = event.parsed
         arp_pkt = pkt.payload
         in_port = event.port
 
         self.arp_table[arp_pkt.protosrc] = (arp_pkt.hwsrc, in_port)
-        log_color(BLUE, f"ARP aprendido: {arp_pkt.protosrc} → {arp_pkt.hwsrc} (port {in_port})")
 
         if arp_pkt.opcode == arp.REQUEST:
             if arp_pkt.protodst == PUBLIC_IP:
@@ -94,26 +145,14 @@ class ProtoRouter(object):
             self._flush_pending(arp_pkt.protosrc)
 
     def _send_arp_reply(self, req, reply_mac, out_port):
-        r = arp()
-        r.opcode = arp.REPLY
-        r.hwsrc = reply_mac
-        r.hwdst = req.hwsrc
-        r.protosrc = req.protodst
-        r.protodst = req.protosrc
-
+        r = arp(opcode=arp.REPLY, hwsrc=reply_mac, hwdst=req.hwsrc, protosrc=req.protodst, protodst=req.protosrc)
         e = ethernet(type=ethernet.ARP_TYPE, src=reply_mac, dst=req.hwsrc, payload=r)
         msg = of.ofp_packet_out(data=e.pack())
         msg.actions.append(of.ofp_action_output(port=out_port))
         self.connection.send(msg)
 
     def _send_arp_request(self, src_ip, src_mac, dst_ip, out_port):
-        r = arp()
-        r.opcode = arp.REQUEST
-        r.hwsrc = src_mac
-        r.hwdst = EthAddr("ff:ff:ff:ff:ff:ff")
-        r.protosrc = src_ip
-        r.protodst = dst_ip
-
+        r = arp(opcode=arp.REQUEST, hwsrc=src_mac, hwdst=EthAddr("ff:ff:ff:ff:ff:ff"), protosrc=src_ip, protodst=dst_ip)
         e = ethernet(type=ethernet.ARP_TYPE, src=src_mac, dst=EthAddr("ff:ff:ff:ff:ff:ff"), payload=r)
         msg = of.ofp_packet_out(data=e.pack())
         msg.actions.append(of.ofp_action_output(port=out_port))
@@ -124,11 +163,10 @@ class ProtoRouter(object):
             return
         pkts = self.pending.pop(ip)
         for (pkt, in_port) in pkts:
-            # Los paquetes en pending siempre son salientes
             self._handle_outbound(pkt, pkt.payload, in_port)
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Manejo de IP & PAT
+    #  Manejo de IP & PAT con Tracking
     # ══════════════════════════════════════════════════════════════════════
     
     def handle_ip(self, event):
@@ -136,41 +174,26 @@ class ProtoRouter(object):
         ip_pkt  = pkt.payload
         in_port = event.port
 
-        log_color(YELLOW, f"IP: {ip_pkt.srcip} → {ip_pkt.dstip} | in_port={in_port} | Proto: {ip_pkt.protocol}")
-
         if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            # ── Paquete SALIENTE (de red privada hacia red pública) ──────
             self._handle_outbound(pkt, ip_pkt, in_port)
-
         elif ip_pkt.dstip == PUBLIC_IP:
-            # ── Paquete ENTRANTE (respuesta del servidor al NAT) ─────────
             self._handle_inbound(pkt, ip_pkt, in_port)
-
-        else:
-            log_color(RED, f"Paquete descartado: {ip_pkt.srcip} → {ip_pkt.dstip} no aplica NAT")
 
     def _handle_outbound(self, packet, ip_pkt, in_port):
         dst_ip = ip_pkt.dstip
 
-        # 1. Resolución ARP del destino
         if dst_ip in self.arp_table:
             dst_mac, _ = self.arp_table[dst_ip]
         else:
-            log_color(CYAN, f"MAC desconocida para {dst_ip}. Guardando en pending.")
             if dst_ip not in self.pending:
                 self.pending[dst_ip] = []
             self.pending[dst_ip].append((packet, in_port))
             self._send_arp_request(src_ip=PUBLIC_IP, src_mac=PUBLIC_MAC, dst_ip=dst_ip, out_port=PUBLIC_PORT)
             return
 
-        # 2. Verificar si es TCP/UDP para aplicar PAT
-        is_tcp_udp = False
-        l4_pkt = None
-        if ip_pkt.protocol == ipv4.TCP_PROTOCOL or ip_pkt.protocol == ipv4.UDP_PROTOCOL:
-            l4_pkt = ip_pkt.payload
-            is_tcp_udp = True
+        is_tcp = (ip_pkt.protocol == ipv4.TCP_PROTOCOL)
+        is_udp = (ip_pkt.protocol == ipv4.UDP_PROTOCOL)
 
-        # Preparar reglas de flujo
         fm = of.ofp_flow_mod()
         fm.idle_timeout = FLOW_TIMEOUT
         fm.match.dl_type = 0x800
@@ -185,117 +208,117 @@ class ProtoRouter(object):
         fm_back.match.nw_dst = PUBLIC_IP
         fm_back.match.in_port = PUBLIC_PORT
 
-        orig_srcip = ip_pkt.srcip
-
-        if is_tcp_udp:
-            # Lógica PAT
+        if is_tcp or is_udp:
+            l4_pkt = ip_pkt.payload
             priv_port = l4_pkt.srcport
             key_out = (ip_pkt.protocol, ip_pkt.srcip, priv_port)
 
             if key_out in self.nat_out:
-                pub_port = self.nat_out[key_out]
+                # Conexión existente: actualizamos timestamp y estado
+                pub_port = self.nat_out[key_out]['pub_port']
+                self.nat_out[key_out]['last_active'] = time.time()
+                if is_tcp:
+                    self._update_tcp_state(self.nat_out[key_out], l4_pkt)
             else:
+                # Nueva conexión: asignamos puerto
                 pub_port = self.next_port
                 self.next_port += 1
                 if self.next_port > NAT_PORT_END:
                     self.next_port = NAT_PORT_START
 
-                self.nat_out[key_out] = pub_port
-                self.nat_in[(ip_pkt.protocol, pub_port)] = (ip_pkt.srcip, priv_port, in_port)
-                log_color(GREEN, f"[PAT CREADO] {ip_pkt.srcip}:{priv_port} -> {PUBLIC_IP}:{pub_port}")
+                self.nat_out[key_out] = {
+                    'pub_port': pub_port,
+                    'state': 'SYN_SENT' if is_tcp else 'ACTIVE',
+                    'last_active': time.time()
+                }
+                
+                self.nat_in[(ip_pkt.protocol, pub_port)] = {
+                    'ip_priv': ip_pkt.srcip,
+                    'port_priv': priv_port,
+                    'in_port': in_port
+                }
+                log_color(GREEN, f"[NUEVA CONEXIÓN] {ip_pkt.srcip}:{priv_port} -> {PUBLIC_IP}:{pub_port} ({'TCP' if is_tcp else 'UDP'})")
 
-            # Filtrar L4 en los flujos
+            # Configurar match para hardware
             fm.match.nw_proto = ip_pkt.protocol
             fm.match.tp_src = priv_port
             fm.match.tp_dst = l4_pkt.dstport
-            
             fm_back.match.nw_proto = ip_pkt.protocol
             fm_back.match.tp_src = l4_pkt.dstport
             fm_back.match.tp_dst = pub_port
 
-            # Acciones L4 (PAT) + IP (NAT) + MAC
+            # Acciones OpenFlow
             fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
             fm.actions.append(of.ofp_action_tp_port.set_src(pub_port))
-            fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-            fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-            fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
-
             fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ip_pkt.srcip))
             fm_back.actions.append(of.ofp_action_tp_port.set_dst(priv_port))
-            fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-            fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
-            fm_back.actions.append(of.ofp_action_output(port=in_port))
 
-            # Modificar paquete actual
+            # Modificamos el payload para el PacketOut
             l4_pkt.srcport = pub_port
-            log_color(CYAN, f"OUTBOUND (PAT): {orig_srcip}:{priv_port} → {PUBLIC_IP}:{pub_port}")
 
         else:
-            # Lógica NAT sin PAT (para ICMP)
-            fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
-            fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-            fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-            fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+            # Lógica ICMP (sin PAT)
+            pass
 
-            fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ip_pkt.srcip))
-            fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-            fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
-            fm_back.actions.append(of.ofp_action_output(port=in_port))
+        # Completar acciones generales IP y MAC
+        fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
+        fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
+        fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+        
+        fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
+        fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
+        fm_back.actions.append(of.ofp_action_output(port=in_port))
 
-            log_color(CYAN, f"OUTBOUND (NAT IP): {orig_srcip} → {PUBLIC_IP}")
-
-        # Enviar flujos al switch
         self.connection.send(fm)
         self.connection.send(fm_back)
 
-        # Modificar IP/MAC del paquete actual y enviarlo
+        # Enviar paquete actual
         ip_pkt.srcip = PUBLIC_IP
         packet.src = PUBLIC_MAC
         packet.dst = dst_mac
-
-        msg = of.ofp_packet_out()
-        msg.data = packet.pack()
+        msg = of.ofp_packet_out(data=packet.pack())
         msg.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
         self.connection.send(msg)
 
     def _handle_inbound(self, packet, ip_pkt, in_port):
-        """Maneja paquetes que llegan al switch y no hicieron match con un flujo de hw."""
-        
-        if ip_pkt.protocol == ipv4.TCP_PROTOCOL or ip_pkt.protocol == ipv4.UDP_PROTOCOL:
+        is_tcp = (ip_pkt.protocol == ipv4.TCP_PROTOCOL)
+        is_udp = (ip_pkt.protocol == ipv4.UDP_PROTOCOL)
+
+        if is_tcp or is_udp:
             l4_pkt = ip_pkt.payload
             pub_port = l4_pkt.dstport
             key_in = (ip_pkt.protocol, pub_port)
 
             if key_in in self.nat_in:
-                priv_ip, priv_port, out_port = self.nat_in[key_in]
+                # Recuperar metadata
+                data_in = self.nat_in[key_in]
+                priv_ip = data_in['ip_priv']
+                priv_port = data_in['port_priv']
+                out_port = data_in['in_port']
                 
-                # Rescatar MAC de destino de la tabla ARP
+                # Actualizar estado de tracking en tabla de salida
+                key_out = (ip_pkt.protocol, priv_ip, priv_port)
+                if key_out in self.nat_out:
+                    self.nat_out[key_out]['last_active'] = time.time()
+                    if is_tcp:
+                        self._update_tcp_state(self.nat_out[key_out], l4_pkt)
+
                 if priv_ip in self.arp_table:
                     dst_mac, _ = self.arp_table[priv_ip]
                     
-                    log_color(CYAN, f"INBOUND (PAT manual): {PUBLIC_IP}:{pub_port} → {priv_ip}:{priv_port}")
-                    
-                    # Modificar paquete
                     l4_pkt.dstport = priv_port
                     ip_pkt.dstip = priv_ip
                     packet.src = PRIVATE_MAC
                     packet.dst = dst_mac
                     
-                    msg = of.ofp_packet_out()
-                    msg.data = packet.pack()
+                    msg = of.ofp_packet_out(data=packet.pack())
                     msg.actions.append(of.ofp_action_output(port=out_port))
                     self.connection.send(msg)
                 else:
-                    log_color(YELLOW, f"No se conoce la MAC interna de {priv_ip}")
-            else:
-                log_color(RED, f"Paquete entrante a {PUBLIC_IP}:{pub_port} sin mapeo NAT activo.")
-        else:
-            log_color(YELLOW, "INBOUND: Paquete no es TCP/UDP (posible ICMP expensivo o sin mapeo). Ignorado.")
+                    log_color(YELLOW, f"MAC interna desconocida para {priv_ip}")
 
 
 def launch():
     def start_switch(event):
-        log_color(YELLOW, f"Iniciando ProtoRouter para Switch {event.connection.dpid}")
         ProtoRouter(event.connection)
-
     core.openflow.addListenerByName("ConnectionUp", start_switch)
