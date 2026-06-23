@@ -1,8 +1,3 @@
-# nat_router.py
-# Coordinador principal del NAT.
-# Orquesta ARPHandler, NATTable y FlowManager.
-# Es el único que escucha eventos OpenFlow directamente.
-
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt

@@ -1,7 +1,3 @@
-# nat_table.py
-# Maneja el estado de las traducciones NAT.
-# No sabe nada de paquetes, OpenFlow ni ARP — solo administra la tabla.
-
 from pox.core import core
 from config import NAT_PORT_START, NAT_PORT_END
 

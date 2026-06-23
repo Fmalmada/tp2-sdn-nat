@@ -1,7 +1,3 @@
-# arp_handler.py
-# Maneja todo lo relacionado al protocolo ARP.
-# No sabe nada de NAT ni de flujos OpenFlow.
-
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt

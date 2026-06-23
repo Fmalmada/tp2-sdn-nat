@@ -1,4 +1,3 @@
-# config.py
 # Configuración central del NAT. Todos los parámetros modificables están acá.
 # Para cambiar IPs/MACs en la demo, solo hay que tocar este archivo.
 

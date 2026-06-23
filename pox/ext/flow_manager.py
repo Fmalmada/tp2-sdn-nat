@@ -1,7 +1,3 @@
-# flow_manager.py
-# Instala y elimina reglas OpenFlow en el switch.
-# No sabe nada de ARP ni del estado NAT — solo construye y envía flow_mods.
-
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 import pox.lib.packet as pkt
