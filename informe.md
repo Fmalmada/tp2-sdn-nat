@@ -369,41 +369,37 @@ curl -v --max-time 5 http://192.168.1.2:9090/
 
 ### 6.7 Flujos instalados en el switch
 
-Verifica que el switch tiene reglas OpenFlow instaladas y maneja el tráfico sin intervención constante del controlador.
-
-Primero generar tráfico TCP para que se instalen los flujos:
+Verifica que el switch instala reglas OpenFlow y procesa el tráfico sin intervención continua del controlador. Se usa iperf TCP con duración larga para poder inspeccionar los flujos mientras están activos.
 
 **xterm h1:**
 ```bash
-python3 -m http.server 8084
+iperf -s -p 5020
 ```
 
 **xterm h2:**
 ```bash
-curl -s http://200.0.0.1:8084/
+iperf -c 200.0.0.1 -p 5020 -t 30
 ```
 
-Luego, desde la **CLI de Mininet** (o un xterm del host con acceso a ovs-ofctl):
-
+Mientras iperf corre, desde la **CLI de Mininet**:
 ```bash
-ovs-ofctl dump-flows s1
+sh ovs-ofctl dump-flows s1
 ```
 
-**Resultado esperado:** la salida incluye entradas con `nw_src=192.168.1.2` (flujo saliente) y `nw_dst=192.168.1.2` (flujo entrante), con contadores de paquetes mayores a 0:
-
+**Resultado esperado:**
 ```
-cookie=0x0, ... nw_src=192.168.1.2,nw_dst=200.0.0.1,nw_proto=6 actions=mod_nw_src:200.0.0.254,...
-cookie=0x0, ... nw_dst=200.0.0.254,nw_proto=6,tp_dst=10000    actions=mod_nw_dst:192.168.1.2,...
+cookie=0x0, duration=Xs, n_packets=N, idle_timeout=60,
+  tcp,nw_src=192.168.1.2,nw_dst=200.0.0.1,tp_src=XXXX,tp_dst=5020
+  actions=mod_nw_src:200.0.0.254,mod_tp_src:10000,
+          mod_dl_src:00:00:00:aa:aa:aa,mod_dl_dst:00:00:00:00:00:01,output:"s1-eth1"
+
+cookie=0x0, duration=Xs, n_packets=N, idle_timeout=60,
+  tcp,in_port="s1-eth1",nw_dst=200.0.0.254,tp_dst=10000
+  actions=mod_nw_dst:192.168.1.2,mod_tp_dst:XXXX,
+          mod_dl_src:00:00:00:bb:bb:bb,mod_dl_dst:00:00:00:00:00:02,output:"s1-eth2"
 ```
 
-También es posible capturar tráfico en tiempo real con tcpdump para verificar la traducción:
-
-**xterm h1** — capturar en interfaz pública:
-```bash
-tcpdump -i h1-eth0 -n
-```
-
-Los paquetes deben mostrar IP origen `200.0.0.254` (nunca `192.168.1.x`), confirmando que el NAT está operando correctamente.
+Dos flujos activos con `n_packets` creciendo y el controlador sin recibir ningún log nuevo. Eso confirma que el switch procesa el tráfico de forma autónoma una vez instalados los flujos.
 
 ---
 
