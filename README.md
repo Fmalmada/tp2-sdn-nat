@@ -10,14 +10,11 @@ python3 pox.py log.level --DEBUG protorouter
 sudo python3 topo.py
 ```
 
+---
 
-### 🧪 Pruebas de **Etapa 1 (ARP Dinámico)**, dentro de la CLI de Mininet (Terminal 2)
+1. Validación de ARP y Conectividad (Criterio 1) 
 
-Ejecuta las siguientes instrucciones dentro de la terminal de Mininet para comprobar el comportamiento dinámico:
-
-Ejecuta las siguientes instrucciones dentro de la terminal de Mininet para comprobar el comportamiento dinámico:
-
-#### 1. Verificar que las tablas ARP estén vacías
+Ejecuta directamente en la consola de Mininet:
 
 Al borrar las líneas estáticas, los hosts no deberían conocer a nadie en la capa 2.
 
@@ -29,172 +26,72 @@ h2 arp -n
 h1 arp -n
 ```
 
-*Deberías ver que no hay entradas registradas para las IPs `192.168.1.254` ni `200.0.0.254`.*
-
-#### 2. Lanzar el Ping de prueba
-
-Manda **3 paquetes** desde el host privado hacia el externo. El primer paquete tardará un poco más (mientras se resuelve el ARP), y los siguientes irán rápido.
-
 ```bash
-h2 ping -c 3 200.0.0.1
+h2 ping -c 2 200.0.0.1
 ```
 
-#### 3. Verificar que aprendieron las MACs autónomamente
-
-Vuelve a revisar las tablas ARP de los hosts. Ahora el protocolo dinámico tuvo que haber hecho su trabajo.
-
-```bash
-h2 arp -n
-```
-
-*Debería aparecer: `192.168.1.254` asociado a `00:00:00:bb:bb:bb`.*
-
-```bash
-h1 arp -n
-```
-
-*Debería aparecer: `200.0.0.254` asociado a `00:00:00:aa:aa:aa`.*
-
----
-
-### 🔍 Qué debes mirar en los logs de POX (Terminal 1)
-
-Hay exactamente **3 pares** de ARP Request/Reply para que la comunicación se establezca por primera vez.
-
-el flujo ultra conciso:
-
-### Lado Privado
-
-1. **Primer Par (`h2` ↔ Switch)**
-* **REQ:** `h2` pregunta: *¿Quién tiene la IP privada del gateway (`192.168.1.254`)?*
-* **REP:** El switch (POX) responde: *Yo la tengo, mi MAC privada es `00:00:00:bb:bb:bb`.*
-* *Resultado:* `h2` ya puede enviar el paquete ICMP al switch.
-
-
-
-### Lado Público
-
-2. **Segundo Par (Switch ↔ `h1`)**
-* **REQ:** El switch (POX) pregunta al mundo exterior: *¿Quién tiene la IP de `h1` (`200.0.0.1`)?*
-* **REP:** `h1` responde: *Yo la tengo, mi MAC es `00:00:00:00:00:01`.*
-* *Resultado:* El switch descongela el ICMP, instala las reglas OpenFlow y le envía el ping a `h1`.
-
-
-3. **Tercer Par (`h1` ↔ Switch)**
-* **REQ:** `h1` (al intentar responder el ping) pregunta: *¿Quién tiene la IP pública del gateway (`200.0.0.254`)?*
-* **REP:** El switch (POX) responde: *Yo la tengo, mi MAC pública es `00:00:00:aa:aa:aa`.*
-* *Resultado:* `h1` ya puede enviar el ICMP Reply de vuelta.
+* 
+**Resultado esperado:** El ping debe responder exitosamente. Esto confirma que el router intercepta el ARP, responde con sus MACs y habilita el flujo de paquetes básico.
 
 
 
 ---
 
-A partir de que terminan estos 3 intercambios, **las tablas ARP de todos están llenas y las reglas OpenFlow están instaladas**. Ya no se transmite ningún ARP más.
+2. Validación de PAT, Tráfico Bidireccional y Multihost (Criterios 2, 3 y 5) 
 
----
-¿Cómo lograr que sea una sola?
-Si quisieras obligar a h1 a aprender la MAC del switch desde el primer Request y ahorrarte ese tercer paquete, podrías entrar a la consola de Mininet y cambiar la configuración del kernel de h1 en caliente ejecutando:
-```bash
-h1 sysctl -w net.ipv4.conf.all.arp_accept=1
-```
+Abre las terminales necesarias con `xterm h1 h1 h2 h3` y corre lo siguiente:
 
-### 🧪 Pruebas de **Etapa 2 (NAT sin PAT)**, dentro de la CLI de Mininet (Terminal 2)
+* 
+**En h1 (Ventana 1 - Inspector):** Corre el sniffer para verificar el enmascaramiento:
 
-1. En la consola de Mininet, abre las terminales (shift+insert para pegar):
-```bash
-xterm h1 h2
-```
-
-
-2. Te aparecerán dos ventanas independientes de fondo negro (una para `h1` y otra para `h2`).
-3. En la ventana de **`h1`** (el host público), pon a escuchar el tráfico de red:
-```bash
-tcpdump -i h1-eth0 -n icmp
-```
-
-
-4. En la ventana de **`h2`** (el host privado), lanza el ping:
-```bash
-ping -c 2 200.0.0.1
-```
-
-### 🧪 Pruebas de **Etapa 3 (PAT)**, dentro de la CLI de Mininet (Terminal 2)
-
-Deberías ver algo así en la terminal del controlador:
-
-```text
-200.0.0.254 > 200.0.0.1: ICMP echo request, id 1234, seq 1 ...
-200.0.0.1 > 200.0.0.254: ICMP echo reply, id 1234, seq 1 ...
-```
-
-
-### 📝 Los 3 comandos en orden (para el machete)
-
-Para cuando tengas que defender el TP o repetir la prueba, este es el orden exacto de los factores:
-
-#### 1. En la ventana de `h1` (Servidor) - Dejarlo escuchando:
-
-```bash
-nc -lnvp 8080 -n
-
-```
-
-*(Levanta el puerto TCP 8080 en modo pasivo/escucha sin resolver DNS).*
-
-#### 2. En la otra ventana de `h1` (o desde Mininet) - Capturar el tráfico:
 
 ```bash
 tcpdump -i h1-eth0 -n tcp
-
 ```
 
-*(Muestra en tiempo real los paquetes TCP que entran y salen de h1, confirmando la IP pública y el puerto 10000).*
 
-#### 3. En la ventana de `h2` (Cliente) - Conectarse al servidor:
+* 
+**En h1 (Ventana 2 - Servidor):** Levanta el puerto de escucha:
+
+
+```bash
+nc -lnvp 8080 -n
+```
+
+
+* 
+**En h2 (Cliente 1):** Conéctate y escribe un mensaje:
+
 
 ```bash
 nc 200.0.0.1 8080
-
 ```
----
 
 
-# Comandos Rápidos - Etapa 4
+* 
+**En h3 (Cliente 2):** Abre una segunda conexión simultánea (cancela un segundo el `nc` de h1 y vuelve a ejecutar `nc -lnvp 8080 -n` para recibir a h3):
 
-## Prueba A: Inactividad UDP (Timeout de 30s)
-1. **h1 (Servidor):** `nc -lnup 9000 -n`
-2. **h2 (Cliente):** `nc -u 200.0.0.1 9000`
-3. **Acción:** Enviar mensaje, dar `Enter` y cerrar `h2` con `Ctrl + C`. 
-4. **Verificación:** Esperar 30 segundos a que POX muestre el log rojo `[GC]` de liberación.
-
----
-
-## Prueba B: Cierre Rápido TCP (Flags / Máx 120s)
-1. **h1 (Servidor):** `nc -lnvp 8080 -n`
-2. **h2 (Cliente):** `nc 200.0.0.1 8080`
-3. **Acción:** Cerrar inmediatamente `h2` con `Ctrl + C`.
-4. **Verificación:** Revisar la consola de POX; en 120 segundos aparecerá el log rojo `[GC]` liberando el puerto.
-
-### Comandos Rápidos - Etapa 5 (Multihost)
-
-**1. En la consola de Mininet (Abrir terminales):**
 
 ```bash
-xterm h1 h1 h2 h3
-
+nc 200.0.0.1 8080
 ```
 
-**2. En las ventanas de h1 (Servidores públicos):**
 
-* **Ventana 1:** `nc -lnvp 8080 -n`
-* **Ventana 2:** `nc -lnvp 8081 -n`
+* 
+**Resultados esperados:** 1.  Los mensajes llegan de ida y vuelta de forma aislada (Criterio 3).
+2.  En el `tcpdump` de `h1` verás que ambos hosts (`h2` y `h3`) le hablan mostrando **únicamente la IP pública `200.0.0.254**` pero usando puertos públicos distintos (ej. `10000` y `10001`) (Criterios 2 y 5).
 
-**3. En los clientes privados (Conexión simultánea):**
 
-* **Ventana de h2:** `nc 200.0.0.1 8080`
-* **Ventana de h3:** `nc 200.0.0.1 8081`
 
-**Verificación:** Envía texto desde ambos. En POX verás crearse en paralelo los puertos `10000` (para `h2`) y `10001` (para `h3`) sin pisarse, mandar un solo numero de preferencia en mensajes.
+---
+
+3. Validación de Limpieza y Fin de Conexión (Criterio 4) 
+
+* 
+**Acción:** Presiona `Ctrl + C` en la terminal de `h2` o `h3` para matar el cliente TCP.
+
+
+* **Resultado esperado:** Mira de inmediato la terminal donde se está ejecutando POX. En menos de 5 segundos verás el log rojo del Garbage Collector: `[GC] Conexión ... liberada`. Esto demuestra que el router no acumula reglas muertas en memoria.
 
 **Salir de Mininet**
 ```bash

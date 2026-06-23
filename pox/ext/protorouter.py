@@ -78,8 +78,8 @@ class ProtoRouter(object):
             time_idle = now - data['last_active']
             state = data['state']
             
-            # Condición 1: TCP cerrado
-            if proto == ipv4.TCP_PROTOCOL and state == 'CLOSED':
+            # Condición 1: TCP cerrado (RST) o detectado cierre por FIN (TP Criterio)
+            if proto == ipv4.TCP_PROTOCOL and state in ['CLOSED', 'CLOSING']:
                 keys_to_delete.append(key_out)
             # Condición 2: Timeout general TCP
             elif proto == ipv4.TCP_PROTOCOL and time_idle > TCP_TIMEOUT:
@@ -106,7 +106,6 @@ class ProtoRouter(object):
             data['state'] = 'CLOSED'
         elif tcp_pkt.FIN:
             # Simplificación: si vemos un FIN, marcamos en proceso de cierre.
-            # En un NAT estricto validaríamos el FIN de ambas direcciones.
             data['state'] = 'CLOSING'
         elif tcp_pkt.SYN and tcp_pkt.ACK:
             data['state'] = 'ESTABLISHED'
@@ -114,7 +113,7 @@ class ProtoRouter(object):
             data['state'] = 'SYN_SENT'
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Dispatcher y ARP (Sin cambios estructurales)
+    #  Dispatcher y ARP 
     # ══════════════════════════════════════════════════════════════════════
 
     def _handle_PacketIn(self, event):
@@ -214,13 +213,11 @@ class ProtoRouter(object):
             key_out = (ip_pkt.protocol, ip_pkt.srcip, priv_port)
 
             if key_out in self.nat_out:
-                # Conexión existente: actualizamos timestamp y estado
                 pub_port = self.nat_out[key_out]['pub_port']
                 self.nat_out[key_out]['last_active'] = time.time()
                 if is_tcp:
                     self._update_tcp_state(self.nat_out[key_out], l4_pkt)
             else:
-                # Nueva conexión: asignamos puerto
                 pub_port = self.next_port
                 self.next_port += 1
                 if self.next_port > NAT_PORT_END:
@@ -239,7 +236,6 @@ class ProtoRouter(object):
                 }
                 log_color(GREEN, f"[NUEVA CONEXIÓN] {ip_pkt.srcip}:{priv_port} -> {PUBLIC_IP}:{pub_port} ({'TCP' if is_tcp else 'UDP'})")
 
-            # Configurar match para hardware
             fm.match.nw_proto = ip_pkt.protocol
             fm.match.tp_src = priv_port
             fm.match.tp_dst = l4_pkt.dstport
@@ -247,20 +243,22 @@ class ProtoRouter(object):
             fm_back.match.tp_src = l4_pkt.dstport
             fm_back.match.tp_dst = pub_port
 
-            # Acciones OpenFlow
             fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
             fm.actions.append(of.ofp_action_tp_port.set_src(pub_port))
             fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ip_pkt.srcip))
             fm_back.actions.append(of.ofp_action_tp_port.set_dst(priv_port))
 
-            # Modificamos el payload para el PacketOut
             l4_pkt.srcport = pub_port
 
         else:
-            # Lógica ICMP (sin PAT)
-            pass
+            # Lógica ICMP (NAT IP simple)
+            fm.match.nw_proto = ip_pkt.protocol
+            fm_back.match.nw_proto = ip_pkt.protocol
+            
+            fm.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
+            fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ip_pkt.srcip))
 
-        # Completar acciones generales IP y MAC
+        # Acciones generales MAC y Salida
         fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
         fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
         fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
@@ -272,7 +270,7 @@ class ProtoRouter(object):
         self.connection.send(fm)
         self.connection.send(fm_back)
 
-        # Enviar paquete actual
+        # Enviar paquete actual modificado
         ip_pkt.srcip = PUBLIC_IP
         packet.src = PUBLIC_MAC
         packet.dst = dst_mac
@@ -290,13 +288,11 @@ class ProtoRouter(object):
             key_in = (ip_pkt.protocol, pub_port)
 
             if key_in in self.nat_in:
-                # Recuperar metadata
                 data_in = self.nat_in[key_in]
                 priv_ip = data_in['ip_priv']
                 priv_port = data_in['port_priv']
                 out_port = data_in['in_port']
                 
-                # Actualizar estado de tracking en tabla de salida
                 key_out = (ip_pkt.protocol, priv_ip, priv_port)
                 if key_out in self.nat_out:
                     self.nat_out[key_out]['last_active'] = time.time()
@@ -316,7 +312,6 @@ class ProtoRouter(object):
                     self.connection.send(msg)
                 else:
                     log_color(YELLOW, f"MAC interna desconocida para {priv_ip}")
-
 
 def launch():
     def start_switch(event):
