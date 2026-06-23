@@ -309,35 +309,42 @@ cat /tmp/udp_h3.txt
 
 Verifica que el controlador aprende MACs dinámicamente y no depende de valores fijos.
 
-**xterm h2** — cambiar MAC y verificar TCP:
+> **Nota:** al bajar y subir la interfaz, Mininet pierde la ruta default (`via 192.168.1.254`) pero no la restaura automáticamente. Es necesario agregarla a mano después de subir la interfaz. Esto no es un bug del NAT sino un comportamiento de Mininet.
+
+**xterm h1** — levantar servidor primero:
+```bash
+python3 -m http.server 8083
+```
+
+**xterm h2** — cambiar MAC, restaurar ruta y verificar:
 ```bash
 # Bajar interfaz, cambiar MAC, subir
 ip link set h2-eth0 down
 ip link set h2-eth0 address 00:00:00:00:ff:ff
 ip link set h2-eth0 up
 
-# Verificar que el cambio tomó efecto
+# Restaurar ruta default (se pierde al bajar la interfaz en Mininet)
+ip route add default via 192.168.1.254
+
+# Verificar MAC y ruta
 ip link show h2-eth0
+ip route show
 
 # Limpiar ARP cache
 ip neigh flush all
 
-# Levantar servidor en h1 antes de este paso (ver abajo)
+# Probar conectividad
 curl -v http://200.0.0.1:8083/
 ```
 
-**xterm h1** — levantar servidor:
-```bash
-python3 -m http.server 8083
-```
-
-**Resultado esperado:** `curl` retorna `HTTP/1.0 200 OK` con la MAC cambiada. Al terminar, restaurar:
+**Resultado esperado:** `ip route show` muestra `default via 192.168.1.254`. El `curl` retorna `HTTP/1.0 200 OK` — el controlador aprendió la nueva MAC `00:00:00:00:ff:ff` vía ARP sin ninguna configuración adicional. Al terminar, restaurar:
 
 **xterm h2:**
 ```bash
 ip link set h2-eth0 down
 ip link set h2-eth0 address 00:00:00:00:00:02
 ip link set h2-eth0 up
+ip route add default via 192.168.1.254
 ```
 
 ---
