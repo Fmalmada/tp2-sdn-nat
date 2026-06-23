@@ -20,4 +20,4 @@ NAT_PORT_START = 10000
 NAT_PORT_END   = 65535
 
 # ── Timeout de flujos OpenFlow ────────────────────────────────────────────
-FLOW_TIMEOUT = 60                       # segundos de inactividad
+FLOW_TIMEOUT = 600                      # segundos de inactividad
