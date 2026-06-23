@@ -118,14 +118,46 @@ tcpdump -i h1-eth0 -n icmp
 ping -c 2 200.0.0.1
 ```
 
-### 🔍 ¿Qué debes observar en la ventana de `h1`?
+### 🧪 Pruebas de **Etapa 3 (PAT)**, dentro de la CLI de Mininet (Terminal 2)
 
-Deberías ver algo así:
+Deberías ver algo así en la terminal del controlador:
 
 ```text
 200.0.0.254 > 200.0.0.1: ICMP echo request, id 1234, seq 1 ...
 200.0.0.1 > 200.0.0.254: ICMP echo reply, id 1234, seq 1 ...
 ```
+
+
+### 📝 Los 3 comandos en orden (para el machete)
+
+Para cuando tengas que defender el TP o repetir la prueba, este es el orden exacto de los factores:
+
+#### 1. En la ventana de `h1` (Servidor) - Dejarlo escuchando:
+
+```bash
+nc -lnvp 8080 -n
+
+```
+
+*(Levanta el puerto TCP 8080 en modo pasivo/escucha sin resolver DNS).*
+
+#### 2. En la otra ventana de `h1` (o desde Mininet) - Capturar el tráfico:
+
+```bash
+tcpdump -i h1-eth0 -n tcp
+
+```
+
+*(Muestra en tiempo real los paquetes TCP que entran y salen de h1, confirmando la IP pública y el puerto 10000).*
+
+#### 3. En la ventana de `h2` (Cliente) - Conectarse al servidor:
+
+```bash
+nc 200.0.0.1 8080
+
+```
+---
+
 
 
 **Salir de Mininet**
